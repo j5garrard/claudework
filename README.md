@@ -1,36 +1,63 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Serendipity
 
-## Getting Started
+A private, chat-first web app that suggests what to watch on **US Netflix** for a two-person household.
+Describe what you're in the mood for; it returns 10 titles that are streaming on Netflix right now,
+each with a short note on why it was picked. It learns from your Netflix viewing history, your
+thumbs up / meh / thumbs down ratings, and NYT Critic's Picks.
 
-First, run the development server:
+## How it works
+
+- **Viewing history:** upload Netflix's viewing-activity CSV. Episodes are grouped into shows and each
+  show or movie is matched to a TMDB title. Anything ambiguous lands in a short review list.
+- **Chat:** Claude turns the request (plus earlier messages) into search criteria. The app gathers
+  candidates from TMDB that are on US Netflix (discover with the Netflix provider, recommendations
+  from titles you like, cast/crew filmographies, NYT Critic's Picks), drops anything you've watched
+  or thumbed down, and Claude picks the best 10 with a reason for each. Availability is re-checked
+  (cached for a day) before results are shown.
+- **Watching together** (default) blends both profiles and avoids titles either person disliked.
+  "Just me" uses only the current profile's ratings.
+- **NYT:** a daily cron pulls new movie and TV reviews from the NYT Article Search API, reads the
+  Critic's Pick flag, and slowly backfills older Critic's Picks (the free key allows ~500 calls/day).
+
+Stack: Next.js (App Router) · Drizzle ORM · libSQL/Turso (SQLite file locally) · Anthropic Claude API ·
+TMDB API · NYT Article Search API. Installable on iPhone via Safari → Share → Add to Home Screen.
+
+## Environment variables
+
+| Name | What |
+| --- | --- |
+| `TMDB_API_KEY` | TMDB "API Read Access Token" (or the short v3 key) |
+| `ANTHROPIC_API_KEY` | Claude API key |
+| `NYT_API_KEY` | NYT developer key (Article Search enabled) |
+| `DATABASE_URL` | `libsql://…turso.io` in production, `file:local.db` locally |
+| `DATABASE_AUTH_TOKEN` | Turso token (production only) |
+| `APP_PASSCODE` | The household passcode for signing in |
+| `AUTH_SECRET` | Any long random string |
+| `CRON_SECRET` | Any long random string; Vercel sends it to the daily NYT sync |
+| `PROFILE_NAMES` | Optional, e.g. `Jeff,Sam` (names can also be changed in the app) |
+| `CLAUDE_MODEL` | Optional, defaults to `claude-opus-5-5` |
+
+## Local development
 
 ```bash
+npm install
+cp .env.example .env.local   # fill in keys
+npm run db:migrate
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+In a sandbox that needs an HTTPS proxy, run Node with `NODE_USE_ENV_PROXY=1`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Deploy (Vercel + Turso, free tiers)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. Create a Turso database (`turso db create serendipity`) and a token (`turso db tokens create serendipity`).
+2. Import this repo in Vercel and add the environment variables above.
+3. Deploy. The build runs the database migrations, and `vercel.json` schedules the daily NYT sync.
 
-## Learn More
+## Tests
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+npm test
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+This product uses the TMDB API but is not endorsed or certified by TMDB. Review data from The New York Times.
