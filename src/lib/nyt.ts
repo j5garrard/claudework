@@ -81,7 +81,7 @@ async function setKv(key: string, value: string) {
  * One sync run: newest reviews from each feed, then a few backfill pages of
  * older Critic's Picks, then match new reviews to TMDB titles.
  */
-export async function syncNyt({ backfillPages = 6, deadlineMs = 240_000 } = {}) {
+export async function syncNyt({ backfillPages = 14, deadlineMs = 270_000 } = {}) {
   const started = Date.now();
   const log: string[] = [];
   const timeLeft = () => deadlineMs - (Date.now() - started);
@@ -96,19 +96,28 @@ export async function syncNyt({ backfillPages = 6, deadlineMs = 240_000 } = {}) 
     const n = await saveDocs(await fetchPage(fq, 0));
     log.push(`${name}: ${n} recent reviews`);
   }
-  for (const [name, fq] of Object.entries(FEEDS)) {
-    const stateKey = `nyt_backfill_${name}`;
+  // Backfill older reviews a few pages per run. Reviews that mention Netflix come
+  // first since those titles are the ones most likely to be streaming there.
+  const jobs = [
+    { name: "movies-netflix", fq: FEEDS.movies, q: "Netflix" },
+    { name: "tv-netflix", fq: FEEDS.tv, q: "Netflix" },
+    { name: "movies-picks", fq: FEEDS.movies, q: "Critic's Pick" },
+    { name: "tv-picks", fq: FEEDS.tv, q: "Critic's Pick" },
+  ];
+  let budget = backfillPages;
+  for (const job of jobs) {
+    const stateKey = `nyt_backfill_${job.name}`;
     let page = Number((await getKv(stateKey)) ?? 1);
-    if (page < 0) continue; // finished
-    for (let i = 0; i < backfillPages / 2 && timeLeft() > PAUSE_MS + 20_000; i++) {
+    while (page >= 0 && budget > 0 && timeLeft() > PAUSE_MS + 20_000) {
       await pace();
-      const docs = await fetchPage(fq, page, "Critic's Pick");
+      const docs = await fetchPage(job.fq, page, job.q);
       await saveDocs(docs);
-      page = docs.length === 0 || page >= 99 ? -1 : page + 1; // Article Search stops at page 100
+      budget--;
+      page = docs.length < 10 || page >= 99 ? -1 : page + 1; // Article Search stops at page 100
       await setKv(stateKey, String(page));
-      if (page < 0) break;
     }
-    log.push(`${name}: backfill at page ${page}`);
+    if (page >= 0) log.push(`${job.name}: backfill at page ${page}`);
+    if (budget <= 0) break;
   }
   const matched = await matchReviews(Math.max(5_000, timeLeft() - 5_000));
   log.push(`matched ${matched} reviews to titles`);

@@ -40,13 +40,15 @@ export const importItems = sqliteTable(
     episodes: integer("episodes").notNull(),
     firstWatched: text("first_watched"),
     lastWatched: text("last_watched"),
-    status: text("status", { enum: ["pending", "matched", "review", "skipped"] }).notNull(),
+    status: text("status", { enum: ["pending", "matched", "review", "skipped", "split"] }).notNull(),
     titleKey: text("title_key"),
     candidates: text("candidates", { mode: "json" }).$type<Candidate[]>(),
+    variants: text("variants", { mode: "json" }).$type<Variant[]>(),
   },
   (t) => [index("import_status_idx").on(t.status)],
 );
 
+export type Variant = { title: string; episodes: number; firstWatched: string; lastWatched: string };
 export type Candidate = { key: string; name: string; year: number | null; posterPath: string | null };
 
 export const ratings = sqliteTable(

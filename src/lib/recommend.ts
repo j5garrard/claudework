@@ -63,7 +63,14 @@ export type RecommendResult = {
   filters: Filters;
 };
 
-export async function recommend(input: RecommendInput, status: (s: string) => void): Promise<RecommendResult> {
+export type Emit = {
+  status: (s: string) => void;
+  /** A confirmed pick, sent as soon as it's ready (the final result may reorder them). */
+  pick?: (card: Card, sessionId: number) => void;
+};
+
+export async function recommend(input: RecommendInput, emit: Emit | ((s: string) => void)): Promise<RecommendResult> {
+  const { status, pick: emitPick } = typeof emit === "function" ? { status: emit, pick: undefined } : emit;
   const now = Date.now();
   const profiles = await listProfiles();
   const me = profiles.find((p) => p.id === input.profileId) ?? profiles[0];
@@ -144,7 +151,12 @@ export async function recommend(input: RecommendInput, status: (s: string) => vo
     .filter((k) => !disliked.has(k) && !meh.has(k))
     .slice(0, seedKeys.length ? 2 : 4);
   const seedTitles = await getTitles(tasteSeeds);
-  for (const k of tasteSeeds) seedKeys.push({ key: k, label: `fans of ${seedTitles.get(k)?.name ?? "your favourites"}`, boost: 1 });
+  // When the request is specific, taste-based picks shouldn't crowd out titles that match it.
+  const specific =
+    criteria.genres.length + criteria.keywords.length + criteria.people.length + criteria.origin_countries.length > 0;
+  for (const k of tasteSeeds) {
+    seedKeys.push({ key: k, label: `fans of ${seedTitles.get(k)?.name ?? "your favourites"}`, boost: specific ? 0.3 : 1 });
+  }
 
   const discoverJobs: Promise<void>[] = [];
   for (const m of types) {
@@ -153,7 +165,7 @@ export async function recommend(input: RecommendInput, status: (s: string) => vo
     const withExtras = { ...base } as Record<string, string | number | undefined>;
     if (keywordIds.length) withExtras.with_keywords = keywordIds.join("|");
     if (m === "movie" && people.length) withExtras.with_people = people.map((p) => p.id).join("|");
-    for (const page of [1, 2]) {
+    for (const page of [1, 2, 3]) {
       discoverJobs.push(discover(m, { ...withExtras, sort_by: "popularity.desc", page }).then((r) => add(r, "discover", 1)));
     }
     discoverJobs.push(
@@ -247,7 +259,9 @@ export async function recommend(input: RecommendInput, status: (s: string) => vo
   const shortlist = pool_.slice(0, 60);
 
   if (shortlist.length === 0) {
-    const msg = "I couldn't find anything on US Netflix that fits all of that. Try loosening a filter or two?";
+    const msg = filters.nytOnly
+      ? "None of the NYT Critic's Picks I've collected so far are on US Netflix and match that. The app pulls in more NYT reviews every day, so try again later, or turn off the NYT-only filter."
+      : "I couldn't find anything on US Netflix that fits all of that. Try loosening a filter or two?";
     await db.insert(schema.chatMessages).values({ sessionId, role: "assistant", content: msg, picks: [], criteria, createdAt: Date.now() });
     return { sessionId, message: msg, picks: [], filters };
   }
@@ -255,6 +269,23 @@ export async function recommend(input: RecommendInput, status: (s: string) => vo
   status("Picking the best 10…");
   const taste = await tasteSummary(weights, ratings, audience, profiles);
   const recent = await recentlySuggested(sessionId);
+  // Accept picks as they stream in: confirm availability, then show the card right away.
+  const accepted: { c: Cand; why: string }[] = [];
+  let chain = Promise.resolve();
+  const sid = sessionId;
+  const accept = (id: number, why: string) => {
+    chain = chain.then(async () => {
+      const c = shortlist[id - 1];
+      if (!c || accepted.length >= SUGGESTIONS || accepted.some((a) => a.c.key === c.key)) return;
+      const d = (await ensureDetails([c.key])).get(c.key);
+      if (d?.onNetflix === false || !runtimeOk(d, filters)) return;
+      accepted.push({ c, why });
+      if (emitPick && filters.sort === "match") {
+        const [card] = await cards([c.key], { [c.key]: { why } });
+        if (card) emitPick(card, sid);
+      }
+    });
+  };
   const ranked = await rankCandidates({
     request: input.message,
     intent: criteria.intent,
@@ -276,19 +307,21 @@ export async function recommend(input: RecommendInput, status: (s: string) => vo
         ].join(" | "),
       )
       .join("\n"),
-  });
+  }, (p) => accept(p.id, p.why));
+  // Anything the stream parser missed is accepted from the final answer.
+  for (const p of ranked.picks) accept(p.id, p.why);
+  await chain;
 
-  // Confirm availability for the final picks (fresh within a day) and backfill if any dropped off.
-  const chosen = ranked.picks
-    .map((p) => ({ c: shortlist[p.id - 1], why: p.why }))
-    .filter((p) => p.c)
-    .filter((p, i, a) => a.findIndex((x) => x.c.key === p.c.key) === i);
-  const details = await ensureDetails(chosen.map((p) => p.c.key));
-  let final = chosen.filter((p) => details.get(p.c.key)?.onNetflix !== false);
-  final = final.filter((p) => runtimeOk(details.get(p.c.key), filters)).slice(0, SUGGESTIONS);
+  // Backfill if any picks dropped off (no longer on Netflix, too long).
+  const final = accepted.slice(0, SUGGESTIONS);
   if (final.length < SUGGESTIONS) {
     const have = new Set(final.map((f) => f.c.key));
-    const extra = shortlist.filter((c) => !have.has(c.key)).slice(0, SUGGESTIONS - final.length + 4);
+    // Prefer titles that matched the request's own search over taste-only ones.
+    const fromSearch = (c: Cand) => c.sources.has("discover") || c.sources.has("acclaimed") ? 1 : 0;
+    const extra = shortlist
+      .filter((c) => !have.has(c.key))
+      .sort((a, b) => fromSearch(b) - fromSearch(a))
+      .slice(0, SUGGESTIONS - final.length + 4);
     const d2 = await ensureDetails(extra.map((c) => c.key));
     for (const c of extra) {
       if (final.length >= SUGGESTIONS) break;
@@ -370,6 +403,7 @@ function discoverParams(m: MediaType, f: Filters, cr: Criteria): Record<string, 
   if (f.minRating) p["vote_average.gte"] = f.minRating;
   p["vote_count.gte"] = m === "movie" ? 50 : 20;
   if (m === "movie" && f.maxRuntime) p["with_runtime.lte"] = f.maxRuntime;
+  if (cr.origin_countries.length) p.with_origin_country = cr.origin_countries.join("|");
   return p;
 }
 

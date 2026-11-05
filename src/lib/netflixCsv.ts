@@ -3,9 +3,18 @@
  * into one entry per show or movie.
  */
 
+export type Variant = { title: string; episodes: number; firstWatched: string; lastWatched: string };
+
 export type HistoryGroup = {
   name: string;
   isShow: boolean;
+  /**
+   * Set when the group was guessed from a shared "Name: …" prefix with no
+   * season marker. It might be a series, or several separate titles
+   * (e.g. "Ali Wong: Baby Cobra" and "Ali Wong: Hard Knock Wife"), so the
+   * original titles are kept for matching.
+   */
+  variants?: Variant[];
   episodes: number;
   firstWatched: string; // YYYY-MM-DD
   lastWatched: string;
@@ -104,6 +113,7 @@ export function groupHistory(csvText: string): HistoryGroup[] {
   // suffixes. Try the longest prefix first so "Avatar: The Last Airbender: X"
   // groups under "Avatar: The Last Airbender".
   const knownShows = new Set(showOf.values());
+  const guessed = new Set<string>();
   const prefixSuffixes = new Map<string, Set<string>>();
   const uniq = [...new Set(unresolved)];
   for (const t of uniq) {
@@ -120,6 +130,7 @@ export function groupHistory(csvText: string): HistoryGroup[] {
       const p = parts.slice(0, i).join(": ");
       if (knownShows.has(p) || (prefixSuffixes.get(p)?.size ?? 0) >= 2) {
         showOf.set(t, p);
+        if (!knownShows.has(p)) guessed.add(t);
         break;
       }
     }
@@ -128,17 +139,28 @@ export function groupHistory(csvText: string): HistoryGroup[] {
   const groups = new Map<string, HistoryGroup>();
   for (const e of entries) {
     const show = showOf.get(e.title);
+    const isGuess = guessed.has(e.title);
     const name = (show ?? e.title).trim();
     if (!name) continue; // Netflix sometimes exports rows with a blank show name
-    const g = groups.get(name);
+    let g = groups.get(name);
     if (!g) {
-      groups.set(name, { name, isShow: !!show, episodes: 1, firstWatched: e.date, lastWatched: e.date });
-    } else {
-      g.episodes++;
-      g.isShow = g.isShow || !!show;
-      if (e.date < g.firstWatched) g.firstWatched = e.date;
-      if (e.date > g.lastWatched) g.lastWatched = e.date;
+      g = { name, isShow: !!show && !isGuess, episodes: 0, firstWatched: e.date, lastWatched: e.date };
+      groups.set(name, g);
+    }
+    g.episodes++;
+    if (show && !isGuess) g.isShow = true;
+    if (e.date < g.firstWatched) g.firstWatched = e.date;
+    if (e.date > g.lastWatched) g.lastWatched = e.date;
+    if (isGuess) {
+      g.variants ??= [];
+      const v = g.variants.find((x) => x.title === e.title);
+      if (v) {
+        v.episodes++;
+        if (e.date < v.firstWatched) v.firstWatched = e.date;
+        if (e.date > v.lastWatched) v.lastWatched = e.date;
+      } else g.variants.push({ title: e.title, episodes: 1, firstWatched: e.date, lastWatched: e.date });
     }
   }
+  for (const g of groups.values()) if (g.isShow) delete g.variants; // a season marker settled it
   return [...groups.values()].sort((a, b) => b.lastWatched.localeCompare(a.lastWatched));
 }

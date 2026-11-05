@@ -11,8 +11,12 @@ export async function POST(req: Request) {
     async start(controller) {
       const send = (o: unknown) => controller.enqueue(enc.encode(JSON.stringify(o) + "\n"));
       try {
-        const result = await recommend({ ...input, message: input.message.trim().slice(0, 2000) }, (text) =>
-          send({ type: "status", text }),
+        const result = await recommend(
+          { ...input, message: input.message.trim().slice(0, 2000) },
+          {
+            status: (text) => send({ type: "status", text }),
+            pick: (card, sessionId) => send({ type: "pick", card, sessionId }),
+          },
         );
         send({ type: "result", ...result });
       } catch (e) {

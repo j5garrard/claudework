@@ -204,14 +204,23 @@ function ChatView({ profileId, mode, profiles, me }: { profileId: number; mode: 
           const ev = JSON.parse(line);
           if (ev.type === "status") setBusy(ev.text);
           else if (ev.type === "error") throw new Error(ev.error);
-          else if (ev.type === "result") {
+          else if (ev.type === "pick") {
+            // Show each card as soon as it's confirmed; the final result replaces this message.
+            setBusy("Finding more…");
+            setMessages((m) => {
+              const last = m[m.length - 1];
+              if (last?.pending) return [...m.slice(0, -1), { ...last, picks: [...last.picks, ev.card] }];
+              return [...m, { role: "assistant", content: "", picks: [ev.card], pending: true }];
+            });
+          } else if (ev.type === "result") {
             setSessionId(ev.sessionId);
             setFilters(ev.filters);
-            setMessages((m) => [...m, { role: "assistant", content: ev.message, picks: ev.picks }]);
+            setMessages((m) => [...m.filter((x) => !x.pending), { role: "assistant", content: ev.message, picks: ev.picks }]);
           }
         }
       }
     } catch (e) {
+      setMessages((m) => m.filter((x) => !x.pending));
       setError(e instanceof Error ? e.message : "Something went wrong");
     } finally {
       setBusy(null);
@@ -303,7 +312,7 @@ function ChatView({ profileId, mode, profiles, me }: { profileId: number; mode: 
             </div>
           ) : (
             <div key={i} className="space-y-2">
-              <p className="leading-snug">{m.content}</p>
+              {m.content && <p className="leading-snug">{m.content}</p>}
               {m.picks.map((c) => (
                 <TitleCard key={c.key} card={c} profileId={profileId} profiles={profiles} onChange={updateCard} onSeen={removeCard} />
               ))}

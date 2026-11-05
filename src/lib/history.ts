@@ -1,8 +1,8 @@
 import { db, schema } from "@/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { groupHistory } from "./netflixCsv";
-import { chunks, norm, pool, saveBasics, search, similarity, type Basic } from "./tmdb";
-import type { Candidate } from "@/db/schema";
+import { chunks, norm, parseKey, pool, saveBasics, search, similarity, tmdb, type Basic } from "./tmdb";
+import type { Candidate, Variant } from "@/db/schema";
 
 const items = schema.importItems;
 
@@ -22,6 +22,7 @@ export async function importCsv(csv: string) {
           episodes: g.episodes,
           firstWatched: g.firstWatched,
           lastWatched: g.lastWatched,
+          variants: g.variants ?? null,
           status: "pending" as const,
         })),
       )
@@ -32,6 +33,7 @@ export async function importCsv(csv: string) {
           episodes: sql`max(${items.episodes}, excluded.episodes)`,
           firstWatched: sql`min(coalesce(${items.firstWatched}, excluded.first_watched), excluded.first_watched)`,
           lastWatched: sql`max(coalesce(${items.lastWatched}, excluded.last_watched), excluded.last_watched)`,
+          variants: sql`excluded.variants`,
         },
       });
     added += chunk.filter((g) => !known.has(g.name)).length;
@@ -55,13 +57,39 @@ export async function importSummary() {
 }
 
 /** Pick the best TMDB match for one CSV group, or return candidates for review. */
+type MatchResult = { titleKey: string | null; candidates: Basic[] };
+
 export async function matchGroup(g: {
   rawName: string;
   isShow: boolean;
   episodes: number;
   firstWatched: string | null;
-}): Promise<{ titleKey: string | null; candidates: Basic[] }> {
-  const watchedYear = g.firstWatched ? Number(g.firstWatched.slice(0, 4)) : 9999;
+  lastWatched?: string | null;
+  variants?: Variant[] | null;
+}): Promise<MatchResult & { split?: { variant: Variant; result: MatchResult }[] }> {
+  const asGroup = await matchName(g);
+  if (asGroup.titleKey || !g.variants || g.variants.length < 2) return asGroup;
+  // No series by that name: these are probably separate titles sharing a prefix
+  // (stand-up specials, documentaries). Match each one on its own.
+  const split = await pool(g.variants, 4, async (v) => ({
+    variant: v,
+    result: await matchName({ rawName: v.title, isShow: false, episodes: v.episodes, firstWatched: v.firstWatched, lastWatched: v.lastWatched }),
+  }));
+  if (split.filter((x) => x.result.titleKey).length * 2 >= split.length) return { ...asGroup, split };
+  return asGroup;
+}
+
+async function matchName(g: {
+  rawName: string;
+  isShow: boolean;
+  episodes: number;
+  firstWatched: string | null;
+  lastWatched?: string | null;
+}): Promise<MatchResult> {
+  // A title can't be watched before it came out. Use the latest viewing: a group can
+  // mix rows (e.g. the 2012 movie "Safe" and the 2018 series "Safe").
+  const lastSeen = g.lastWatched ?? g.firstWatched;
+  const watchedYear = lastSeen ? Number(lastSeen.slice(0, 4)) : 9999;
   const showLike = g.isShow || g.episodes > 1;
   const queries: { q: string; kind: "tv" | "multi" }[] = [{ q: g.rawName, kind: showLike ? "tv" : "multi" }];
   // "Show: Episode title" rows that weren't recognized as a show: also try the prefix as a series.
@@ -81,7 +109,6 @@ export async function matchGroup(g: {
       if (++failures === queries.length) throw e;
       continue;
     }
-    // A title can't have been watched before it came out.
     results = results.filter((r) => !r.year || r.year <= watchedYear + 1);
     for (const r of results.slice(0, 5)) if (!seen.has(r.key)) seen.set(r.key, r);
     const exact = results.filter((r) => norm(r.name) === norm(q));
@@ -95,7 +122,18 @@ export async function matchGroup(g: {
       return { titleKey: close[0].key, candidates: [close[0]] };
     }
   }
-  return { titleKey: null, candidates: [...seen.values()].slice(0, 4) };
+  // Netflix often uses a US title ("The Great British Baking Show" is TMDB's
+  // "The Great British Bake Off"). Check alternative titles of the top results.
+  const top = [...seen.values()].slice(0, 4);
+  for (const c of top) {
+    const { mediaType, id } = parseKey(c.key);
+    const alt = await tmdb<{ titles?: { title: string }[]; results?: { title: string }[] }>(
+      `/${mediaType}/${id}/alternative_titles`,
+    ).catch(() => ({ titles: [], results: [] }));
+    const names = (alt.titles ?? alt.results ?? []).map((t) => norm(t.title));
+    if (queries.some(({ q }) => names.includes(norm(q)))) return { titleKey: c.key, candidates: [c] };
+  }
+  return { titleKey: null, candidates: top };
 }
 
 const score = (b: Basic) => (b.popularity ?? 0) + (b.voteCount ?? 0) / 100;
@@ -103,15 +141,31 @@ const score = (b: Basic) => (b.popularity ?? 0) + (b.voteCount ?? 0) / 100;
 /** Match a batch of pending groups. Returns how many are still pending. */
 export async function processPending(limit = 40) {
   const batch = await db.select().from(items).where(eq(items.status, "pending")).limit(limit);
-  await pool(batch, 8, async (g) => {
+  const toCandidates = (bs: Basic[]): Candidate[] =>
+    bs.map((c) => ({ key: c.key, name: c.name, year: c.year, posterPath: c.posterPath }));
+  await pool(batch, 6, async (g) => {
     const m = await matchGroup(g);
+    if (m.split) {
+      // Replace the guessed group with one row per original title.
+      for (const { variant: v, result: r } of m.split) {
+        await saveBasics(r.candidates);
+        const row = {
+          rawName: v.title,
+          isShow: false,
+          episodes: v.episodes,
+          firstWatched: v.firstWatched,
+          lastWatched: v.lastWatched,
+          status: (r.titleKey ? "matched" : "review") as "matched" | "review",
+          titleKey: r.titleKey,
+          candidates: toCandidates(r.candidates),
+        };
+        await db.insert(items).values(row).onConflictDoUpdate({ target: items.rawName, set: row });
+      }
+      await db.update(items).set({ status: "split", candidates: [] }).where(eq(items.rawName, g.rawName));
+      return;
+    }
     await saveBasics(m.candidates);
-    const candidates: Candidate[] = m.candidates.map((c) => ({
-      key: c.key,
-      name: c.name,
-      year: c.year,
-      posterPath: c.posterPath,
-    }));
+    const candidates = toCandidates(m.candidates);
     await db
       .update(items)
       .set(m.titleKey ? { status: "matched", titleKey: m.titleKey, candidates } : { status: "review", candidates })

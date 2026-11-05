@@ -16,6 +16,9 @@ export const CriteriaSchema = z.object({
   keywords: z.array(z.string()).describe("Short TMDB-style themes/settings, e.g. 'heist', 'small town', 'time travel'"),
   similar_to: z.array(z.string()).describe("Titles the person wants things like. Use exact title names; resolve 'the second one' from previous results"),
   people: z.array(z.string()).describe("Actors or directors named"),
+  origin_countries: z
+    .array(z.string())
+    .describe("ISO 3166-1 country codes when they ask for a country of origin, e.g. ['GB'] for British, ['KR'] for Korean"),
   year_min: z.number().int().nullable(),
   year_max: z.number().int().nullable(),
   min_rating: z.number().nullable().describe("Minimum TMDB score out of 10"),
@@ -63,7 +66,7 @@ export const RankSchema = z.object({
   message: z.string().describe("One or two friendly sentences introducing the picks. No list."),
   picks: z
     .array(z.object({ id: z.number().int().describe("Candidate number"), why: z.string() }))
-    .describe("Best first. 13 picks if possible, fewer only if candidates run out."),
+    .describe("Best first. Always 13 picks (fewer only if there are fewer candidates)."),
 });
 
 const RANK_SYSTEM = `You pick what to watch tonight for a household, from a list of titles confirmed to be streaming on US Netflix.
@@ -73,22 +76,33 @@ Rules:
 - Titles they rated "meh" and their themes count against a candidate.
 - An NYT Critic's Pick is a plus, but taste and fit matter more.
 - Vary the picks unless they asked for something narrow.
+- Always return 13 picks. If fewer than 13 fit well, finish with the closest fits and be honest in their "why" (e.g. "Not British, but the same gentle pace").
 - Avoid titles listed as recently suggested unless they ask to see them again.
 - Each "why" is one or two short sentences, specific to this household and request: point to a title they loved, an actor, the mood they asked for, or the NYT review. Don't restate the plot.`;
 
-export async function rankCandidates(input: {
-  request: string;
-  intent: string;
-  together: boolean;
-  people: string;
-  taste: string;
-  recentlySuggested: string;
-  candidates: string;
-}) {
-  const res = await ai().messages.parse({
+export type RankedPick = { id: number; why: string };
+
+/**
+ * Rank candidates, streaming. onPick fires as each pick completes, so the app
+ * can show cards before the whole answer is written.
+ */
+export async function rankCandidates(
+  input: {
+    request: string;
+    intent: string;
+    together: boolean;
+    people: string;
+    taste: string;
+    recentlySuggested: string;
+    candidates: string;
+  },
+  onPick?: (p: RankedPick) => void,
+) {
+  const format = zodOutputFormat(RankSchema);
+  const stream = ai().messages.stream({
     model: MODEL,
     max_tokens: 8000,
-    output_config: { effort: "low", format: zodOutputFormat(RankSchema) },
+    output_config: { effort: "low", format: { type: "json_schema", schema: format.schema } },
     system: RANK_SYSTEM,
     messages: [
       {
@@ -109,6 +123,20 @@ ${input.candidates}`,
       },
     ],
   });
-  if (!res.parsed_output) throw new Error("Couldn't rank suggestions. Please try again.");
-  return res.parsed_output;
+  let text = "";
+  let emitted = 0;
+  const pickRe = /\{\s*"id"\s*:\s*(\d+)\s*,\s*"why"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/g;
+  stream.on("text", (delta) => {
+    text += delta;
+    if (!onPick) return;
+    const found = [...text.matchAll(pickRe)];
+    for (; emitted < found.length; emitted++) {
+      const m = found[emitted];
+      onPick({ id: Number(m[1]), why: JSON.parse(`"${m[2]}"`) as string });
+    }
+  });
+  const final = await stream.finalMessage();
+  if (final.stop_reason === "refusal") throw new Error("Couldn't rank suggestions. Please try again.");
+  const body = final.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
+  return format.parse(body);
 }
