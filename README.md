@@ -29,8 +29,8 @@ TMDB API · NYT Article Search API. Installable on iPhone via Safari → Share �
 | `TMDB_API_KEY` | TMDB "API Read Access Token" (or the short v3 key) |
 | `ANTHROPIC_API_KEY` | Claude API key |
 | `NYT_API_KEY` | NYT developer key (Article Search enabled) |
-| `DATABASE_URL` | `libsql://…turso.io` in production, `file:local.db` locally |
-| `DATABASE_AUTH_TOKEN` | Turso token (production only) |
+| `DATABASE_URL` | `libsql://…turso.io` in production, `file:local.db` locally (`TURSO_DATABASE_URL` also works) |
+| `DATABASE_AUTH_TOKEN` | Turso token, production only (`TURSO_AUTH_TOKEN` also works) |
 | `APP_PASSCODE` | The household passcode for signing in |
 | `AUTH_SECRET` | Any long random string |
 | `CRON_SECRET` | Any long random string; Vercel sends it to the daily NYT sync |
@@ -50,9 +50,11 @@ In a sandbox that needs an HTTPS proxy, run Node with `NODE_USE_ENV_PROXY=1`.
 
 ## Deploy (Vercel + Turso, free tiers)
 
-1. Create a Turso database (`turso db create serendipity`) and a token (`turso db tokens create serendipity`).
-2. Import this repo in Vercel and add the environment variables above.
-3. Deploy. The build runs the database migrations, and `vercel.json` schedules the daily NYT sync.
+1. In Vercel, Add New → Project → import this repo.
+2. In the project's Storage tab, add a Turso database (Marketplace). It sets `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` for you.
+   (Or create one at turso.tech and set `DATABASE_URL` / `DATABASE_AUTH_TOKEN` yourself.)
+3. Add the other environment variables above, then redeploy. The build runs the database
+   migrations, and `vercel.json` schedules the daily NYT sync.
 
 ## Tests
 
